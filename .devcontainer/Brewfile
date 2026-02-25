@@ -1,0 +1,17 @@
+# Brewfile - Homebrew dependencies for devcontainer
+tap "homebrew/bundle"
+
+# Essential CLI tools
+brew "gh"
+brew "git"
+brew "jq"
+brew "curl"
+brew "wget"
+brew "tree"
+brew "ripgrep"
+brew "bat"
+brew "plantuml"
+brew "uv"
+brew "tmux"
+
+# Add your other packages here
