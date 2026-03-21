@@ -15,7 +15,7 @@ import sys
 import time
 import shutil
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Set
 
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
@@ -111,6 +111,36 @@ def chunked(iterable: Iterable[str], size: int) -> Iterable[List[str]]:
         yield chunk
 
 
+def existing_audio_ids(real_dir: Path) -> Set[str]:
+    ids: Set[str] = set()
+    if not real_dir.exists():
+        return ids
+    for p in real_dir.iterdir():
+        if p.is_file():
+            ids.add(p.stem)
+    return ids
+
+
+def write_report(
+    report_path: Path,
+    total: int,
+    success_ids: Set[str],
+    failure_ids: Set[str],
+    interrupted: bool = False,
+) -> None:
+    processed = len(success_ids) + len(failure_ids)
+    with report_path.open("w", encoding="utf-8") as f:
+        f.write(f"Total: {total}\n")
+        f.write(f"Processed: {processed}\n")
+        f.write(f"Success: {len(success_ids)}\n")
+        f.write(f"Failed: {len(failure_ids)}\n")
+        f.write(f"Interrupted: {interrupted}\n")
+        if failure_ids:
+            f.write("\nFailed IDs:\n")
+            for youtube_id in sorted(failure_ids):
+                f.write(f"{youtube_id}\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -200,8 +230,6 @@ def main() -> int:
                 repo_id="awsaf49/sonics",
                 repo_type="dataset",
                 local_dir=str(base_dir),
-                local_dir_use_symlinks=False,
-                resume_download=True,
                 token=args.hf_token or os.environ.get("HF_TOKEN"),
             )
             last_err = None
@@ -224,6 +252,7 @@ def main() -> int:
         if args.yt_archive
         else base_dir / "yt_dlp_archive.txt"
     )
+    report_path = base_dir / "real_songs_download_report.txt"
 
     ffmpeg_available = shutil.which("ffmpeg") is not None
     if args.extract_audio is None:
@@ -231,8 +260,9 @@ def main() -> int:
     else:
         extract_audio = args.extract_audio
     if extract_audio and not ffmpeg_available:
-        print("ffmpeg not found; disabling audio extraction.")
-        extract_audio = False
+        raise RuntimeError(
+            "ffmpeg not found but --extract-audio was requested. Install ffmpeg or use --no-extract-audio."
+        )
 
     js_runtime = args.yt_js_runtime
     if js_runtime is None:
@@ -255,46 +285,52 @@ def main() -> int:
     youtube_ids = read_youtube_ids(real_csv)
     total = len(youtube_ids)
     print(f"Found {total} YouTube IDs")
+    print(f"Audio extraction enabled: {extract_audio}")
+    print(f"JS runtime: {js_runtime or 'none'}")
 
-    successes: List[str] = []
-    failures: List[str] = []
+    valid_ids = set(youtube_ids)
+    success_ids: Set[str] = existing_audio_ids(real_dir).intersection(valid_ids)
+    failure_ids: Set[str] = set()
+    write_report(report_path, total, success_ids, failure_ids, interrupted=False)
 
-    for batch in chunked(youtube_ids, args.batch_size):
-        for youtube_id in tqdm(batch, desc="Downloading real songs", unit="song"):
-            suffix = args.audio_format if extract_audio else "bestaudio"
-            output_path = real_dir / f"{youtube_id}.{suffix}"
-            log_file = logs_dir / f"{youtube_id}.log"
-            ok = run_yt_dlp(
-                youtube_id,
-                output_path,
-                args.audio_format,
-                archive_path,
-                extract_audio,
-                js_runtime,
-                args.yt_retries,
-                args.yt_fragment_retries,
-                args.yt_extractor_retries,
-                args.yt_socket_timeout,
-                log_file,
+    try:
+        for batch in chunked(youtube_ids, args.batch_size):
+            for youtube_id in tqdm(batch, desc="Downloading real songs", unit="song"):
+                if youtube_id in success_ids:
+                    continue
+
+                suffix = args.audio_format if extract_audio else "bestaudio"
+                output_path = real_dir / f"{youtube_id}.{suffix}"
+                log_file = logs_dir / f"{youtube_id}.log"
+                ok = run_yt_dlp(
+                    youtube_id,
+                    output_path,
+                    args.audio_format,
+                    archive_path,
+                    extract_audio,
+                    js_runtime,
+                    args.yt_retries,
+                    args.yt_fragment_retries,
+                    args.yt_extractor_retries,
+                    args.yt_socket_timeout,
+                    log_file,
+                )
+                if ok:
+                    success_ids.add(youtube_id)
+                    failure_ids.discard(youtube_id)
+                else:
+                    failure_ids.add(youtube_id)
+
+            write_report(report_path, total, success_ids, failure_ids, interrupted=False)
+            print(
+                f"Progress: {len(success_ids)} ok, {len(failure_ids)} failed, {total} total"
             )
-            if ok:
-                successes.append(youtube_id)
-            else:
-                failures.append(youtube_id)
-        print(
-            f"Progress: {len(successes)} ok, {len(failures)} failed, {total} total"
-        )
+    except KeyboardInterrupt:
+        write_report(report_path, total, success_ids, failure_ids, interrupted=True)
+        print(f"Interrupted. Partial report written to: {report_path}")
+        return 130
 
-    report_path = base_dir / "real_songs_download_report.txt"
-    with report_path.open("w", encoding="utf-8") as f:
-        f.write(f"Total: {total}\n")
-        f.write(f"Success: {len(successes)}\n")
-        f.write(f"Failed: {len(failures)}\n")
-        if failures:
-            f.write("\nFailed IDs:\n")
-            for youtube_id in failures:
-                f.write(f"{youtube_id}\n")
-
+    write_report(report_path, total, success_ids, failure_ids, interrupted=False)
     print(f"Report written to: {report_path}")
     return 0
 
