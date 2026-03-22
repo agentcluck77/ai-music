@@ -1,168 +1,131 @@
 #!/usr/bin/env python3
 """
-Test script to verify the training pipeline works.
-Generates dummy audio data and runs a small training loop.
+Smoke-test the AST pipeline against the downloaded SONICS dataset.
+Loads small samples from the official train/valid splits, runs a few optimization steps,
+and performs one inference pass on a held-out file.
 """
 
+import argparse
+import csv
 import os
-import torch
-import torchaudio
-import torchaudio.transforms as T
-import numpy as np
+import shutil
 from pathlib import Path
 
+import torch
+from torch.utils.data import DataLoader
+from transformers import ASTFeatureExtractor
 
-def generate_dummy_audio(
-    duration=30.0, sample_rate=16000, frequency=440.0, noise_level=0.1
-):
-    """Generate a simple sine wave with noise."""
-    t = torch.linspace(0, duration, int(sample_rate * duration))
-    signal = torch.sin(2 * torch.pi * frequency * t)
-    noise = torch.randn_like(signal) * noise_level
-    waveform = signal + noise
-    return waveform.unsqueeze(0)  # Add channel dimension
+from inference import MusicClassifier
+from train_ast import (
+    ASTBinaryClassifier,
+    Config,
+    MusicDataset,
+    SplitPathResolver,
+    set_seed,
+)
 
 
-def create_test_dataset():
-    """Create a small test dataset with dummy audio files."""
-    print("Creating test dataset...")
+def load_records_for_split(metadata_csv, split_name, target_count, resolver):
+    records = []
+    with open(metadata_csv, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row["split"] != split_name:
+                continue
 
-    # Create directories
-    real_dir = Path("test_data/real")
-    ai_dir = Path("test_data/ai")
-    real_dir.mkdir(parents=True, exist_ok=True)
-    ai_dir.mkdir(parents=True, exist_ok=True)
+            if row["label"] == "real":
+                lookup_row = {
+                    "label": "real",
+                    "filename": row["filename"],
+                    "youtube_id": row["youtube_id"],
+                    "filepath": f"real_songs/{row['filename']}.mp3",
+                }
+                binary = 0
+            else:
+                lookup_row = {
+                    "label": row["label"],
+                    "filename": row["filename"],
+                    "filepath": f"fake_songs/{row['filename']}.mp3",
+                }
+                binary = 1
 
-    # Generate dummy files
-    num_files_per_class = 5
+            resolved = resolver.resolve(lookup_row)
+            if resolved is None:
+                continue
 
-    for i in range(num_files_per_class):
-        # Real music (different frequencies)
-        freq_real = 220 + i * 100
-        waveform_real = generate_dummy_audio(
-            duration=15.0 + i * 5.0,  # Varying durations
-            sample_rate=16000,
-            frequency=freq_real,
-            noise_level=0.05,
+            records.append((resolved, binary))
+            if len(records) >= target_count:
+                break
+
+    if len(records) < target_count:
+        raise RuntimeError(
+            f"Requested {target_count} rows from {metadata_csv} split={split_name}, found {len(records)}"
         )
-        real_path = real_dir / f"real_{i}.wav"
-        torchaudio.save(str(real_path), waveform_real, 16000)
-
-        # AI music (different frequencies)
-        freq_ai = 880 + i * 50
-        waveform_ai = generate_dummy_audio(
-            duration=12.0 + i * 3.0,
-            sample_rate=16000,
-            frequency=freq_ai,
-            noise_level=0.2,  # More noise for AI
-        )
-        ai_path = ai_dir / f"ai_{i}.wav"
-        torchaudio.save(str(ai_path), waveform_ai, 16000)
-
-    print(f"Created {num_files_per_class} files in each directory")
-    return str(real_dir), str(ai_dir)
+    return records
 
 
-def test_dataset_loading():
-    """Test that the dataset can be loaded and processed."""
-    print("\nTesting dataset loading...")
+def load_smoke_datasets(args, feature_extractor):
+    resolver = SplitPathResolver(args.data_root, args.real_dir, args.ai_dir)
+    train_real = args.train_samples // 2
+    train_fake = args.train_samples - train_real
+    valid_real = args.valid_samples // 2
+    valid_fake = args.valid_samples - valid_real
 
-    from train_ast import MusicDataset, Config
-    from transformers import ASTFeatureExtractor
-
-    # Create test dataset
-    real_dir, ai_dir = create_test_dataset()
-
-    # Initialize feature extractor
-    feature_extractor = ASTFeatureExtractor.from_pretrained(
-        "MIT/ast-finetuned-audioset-10-10-0.4593",
-        sampling_rate=16000,
-        num_mel_bins=128,
-        max_length=1024,
+    train_records = load_records_for_split(
+        f"{args.data_root}/real_songs.csv", "train", train_real, resolver
+    ) + load_records_for_split(
+        f"{args.data_root}/fake_songs.csv", "train", train_fake, resolver
+    )
+    valid_records = load_records_for_split(
+        f"{args.data_root}/real_songs.csv", "valid", valid_real, resolver
+    ) + load_records_for_split(
+        f"{args.data_root}/fake_songs.csv", "valid", valid_fake, resolver
     )
 
-    # Create dataset
-    dataset = MusicDataset(
-        real_dir=real_dir,
-        ai_dir=ai_dir,
+    train_dataset = MusicDataset(
+        train_records,
         feature_extractor=feature_extractor,
-        segment_duration=10.0,
+        segment_duration=Config.segment_duration,
+        augment=True,
+        config=Config,
+    )
+    valid_dataset = MusicDataset(
+        valid_records,
+        feature_extractor=feature_extractor,
+        segment_duration=Config.segment_duration,
         augment=False,
         config=Config,
     )
+    return train_dataset, valid_dataset, valid_records
 
-    print(f"Dataset size: {len(dataset)}")
 
-    # Try loading one sample
-    spectrogram, label = dataset[0]
+
+def test_dataset_loading(train_dataset):
+    print("\nTesting dataset loading...")
+    spectrogram, label = train_dataset[0]
+    print(f"Dataset size: {len(train_dataset)}")
     print(f"Spectrogram shape: {spectrogram.shape}")
     print(f"Label: {label}")
 
-    return dataset
 
 
-def test_training_loop():
-    """Test a minimal training loop."""
+def test_training_loop(train_dataset, valid_dataset, batch_size):
     print("\nTesting training loop...")
 
-    from train_ast import MusicDataset, ASTBinaryClassifier, Config
-    from transformers import ASTFeatureExtractor
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, random_split
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Create test dataset
-    real_dir, ai_dir = create_test_dataset()
+    model = ASTBinaryClassifier(model_name=Config.model_name, num_labels=2)
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
 
-    # Initialize feature extractor
-    feature_extractor = ASTFeatureExtractor.from_pretrained(
-        "MIT/ast-finetuned-audioset-10-10-0.4593",
-        sampling_rate=16000,
-        num_mel_bins=128,
-        max_length=1024,
-    )
-
-    # Create dataset
-    dataset = MusicDataset(
-        real_dir=real_dir,
-        ai_dir=ai_dir,
-        feature_extractor=feature_extractor,
-        segment_duration=10.0,
-        augment=False,
-        config=Config,
-    )
-
-    # Split dataset
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-    print(f"Train size: {train_size}, Val size: {val_size}")
-
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False)
-
-    # Initialize model
-    model = ASTBinaryClassifier(
-        model_name="MIT/ast-finetuned-audioset-10-10-0.4593", num_labels=2
-    )
-
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
-
-    # Move to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
     print(f"Using device: {device}")
 
-    # Training loop for 1 epoch
     model.train()
-    total_loss = 0
-    for batch_idx, (spectrograms, labels) in enumerate(train_loader):
+    total_loss = 0.0
+    batch_count = 0
+    for batch_count, (spectrograms, labels) in enumerate(train_loader, start=1):
         spectrograms = spectrograms.to(device)
         labels = labels.to(device)
 
@@ -173,14 +136,12 @@ def test_training_loop():
         optimizer.step()
 
         total_loss += loss.item()
-
-        if batch_idx >= 2:  # Just test a few batches
+        if batch_count >= 2:
             break
 
-    avg_loss = total_loss / min(3, batch_idx + 1)
+    avg_loss = total_loss / max(batch_count, 1)
     print(f"Test training loss: {avg_loss:.4f}")
 
-    # Validation
     model.eval()
     with torch.no_grad():
         for spectrograms, labels in val_loader:
@@ -196,69 +157,71 @@ def test_training_loop():
     return model
 
 
-def test_inference():
-    """Test inference on a single file."""
+
+def test_inference(model_path, sample_audio_path):
     print("\nTesting inference...")
+    classifier = MusicClassifier(model_path)
+    result = classifier.classify_file(sample_audio_path)
+    print(f"Inference result: {result}")
 
-    from inference import MusicClassifier
-
-    # First, train a quick model
-    model = test_training_loop()
-
-    # Save model
-    torch.save(model.state_dict(), "test_model.pth")
-    print("Saved test model")
-
-    # Test inference on a test file
-    test_file = "test_data/real/real_0.wav"
-    if os.path.exists(test_file):
-        classifier = MusicClassifier("test_model.pth")
-        result = classifier.classify_file(test_file)
-        print(f"Inference result: {result}")
-    else:
-        print(f"Test file not found: {test_file}")
 
 
 def main():
-    """Run all tests."""
+    parser = argparse.ArgumentParser(description="Smoke-test AST pipeline on SONICS")
+    parser.add_argument("--data_root", type=str, default=Config.data_root)
+    parser.add_argument("--real_dir", type=str, default=Config.real_dir)
+    parser.add_argument("--ai_dir", type=str, default=Config.ai_dir)
+    parser.add_argument("--train_samples", type=int, default=16)
+    parser.add_argument("--valid_samples", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--model_path", type=str, default="test_model.pth")
+    args = parser.parse_args()
+
     print("=" * 60)
-    print("Testing AST Music Classifier Pipeline")
+    print("Testing AST Music Classifier Pipeline On SONICS")
     print("=" * 60)
+
+    set_seed(42)
 
     try:
-        # Test dataset loading
-        dataset = test_dataset_loading()
+        feature_extractor = ASTFeatureExtractor.from_pretrained(
+            Config.model_name,
+            sampling_rate=Config.sample_rate,
+            num_mel_bins=Config.n_mels,
+            max_length=Config.max_length,
+        )
+        train_dataset, valid_dataset, valid_records = load_smoke_datasets(args, feature_extractor)
+        test_dataset_loading(train_dataset)
+        model = test_training_loop(train_dataset, valid_dataset, args.batch_size)
 
-        # Test training loop
-        model = test_training_loop()
+        torch.save(model.state_dict(), args.model_path)
+        print(f"Saved test model to {args.model_path}")
 
-        # Test inference
-        test_inference()
+        sample_audio_path = valid_records[0][0]
+        test_inference(args.model_path, sample_audio_path)
 
         print("\n" + "=" * 60)
         print("All tests passed successfully!")
         print("=" * 60)
 
-        # Clean up test data
-        import shutil
-
-        if os.path.exists("test_data"):
-            shutil.rmtree("test_data")
-            print("Cleaned up test data")
-
-        if os.path.exists("test_model.pth"):
-            os.remove("test_model.pth")
-            print("Cleaned up test model")
-
-    except Exception as e:
-        print(f"Test failed with error: {e}")
+    except Exception as exc:
+        print(f"Test failed with error: {exc}")
         import traceback
 
         traceback.print_exc()
         return 1
 
+    finally:
+        model_path = Path(args.model_path)
+        if model_path.exists():
+            model_path.unlink()
+            print(f"Removed temporary model {model_path}")
+        temp_dir = Path("test_data")
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
     return 0
 
 
 if __name__ == "__main__":
-    exit(main())
+    raise SystemExit(main())

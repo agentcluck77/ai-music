@@ -14,6 +14,8 @@ from transformers import ASTFeatureExtractor, ASTForAudioClassification
 import argparse
 from pathlib import Path
 
+AUDIO_GLOBS = ("*.wav", "*.WAV", "*.mp3", "*.flac", "*.m4a", "*.ogg", "*.opus", "*.webm", "*.mp4")
+
 
 # Model class (same as in training script)
 class ASTBinaryClassifier(nn.Module):
@@ -234,12 +236,8 @@ def main():
         audio_files = [args.audio_path]
     elif args.audio_dir:
         audio_dir = Path(args.audio_dir)
-        audio_files = (
-            list(audio_dir.glob("*.wav"))
-            + list(audio_dir.glob("*.WAV"))
-            + list(audio_dir.glob("*.mp3"))
-            + list(audio_dir.glob("*.flac"))
-        )
+        for pattern in AUDIO_GLOBS:
+            audio_files.extend(audio_dir.glob(pattern))
     else:
         print("Please specify either --audio_path or --audio_dir")
         return
